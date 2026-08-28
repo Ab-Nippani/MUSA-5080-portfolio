@@ -35,9 +35,11 @@ sessionInfo()$R.version$version.string
 
 <!-- CHANGE THIS: 3-4 sentences -->
 
-What I want out of this course:
+What I want out of this course: To get a better grasp on using spatial data so I can use
+it for analysis related to socio-spatial outcomes in urban contexts in  developing countries.
 
-One thing I'm nervous about:
+One thing I'm nervous about: Being able to come up with important questions and find relevant data to 
+answer them.
 
 ## Questions I Still Have
 
