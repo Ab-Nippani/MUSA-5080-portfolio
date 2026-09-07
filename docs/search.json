@@ -81,7 +81,56 @@
     "href": "assignments/index.html",
     "title": "Assignments",
     "section": "",
-    "text": "Completed assignments for MUSA 5080. New assignments appear here automatically once you add the .qmd file to this folder and render.\n\n\n\n\n\n\n\n\n\n\nNo matching items"
+    "text": "Completed assignments for MUSA 5080. New assignments appear here automatically once you add the .qmd file to this folder and render.\n\n\n\n\n\n\n\n\n\n\n\nAssignment 2: Who Do We Know the Least About?\n\n\n\n\n\n\n\n\nSep 6, 2026\n\n\n\n\n\nNo matching items"
+  },
+  {
+    "objectID": "assignments/assignment2.html",
+    "href": "assignments/assignment2.html",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "",
+    "text": "library(tidyverse)\nlibrary(tidycensus)"
+  },
+  {
+    "objectID": "assignments/assignment2.html#setup",
+    "href": "assignments/assignment2.html#setup",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "",
+    "text": "library(tidyverse)\nlibrary(tidycensus)"
+  },
+  {
+    "objectID": "assignments/assignment2.html#the-question",
+    "href": "assignments/assignment2.html#the-question",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "The question",
+    "text": "The question\nEvery number the American Community Survey publishes is an estimate drawn from a sample, not a count. That means every number comes with a margin of error — a statement about how wrong it might be.\nMost people ignore it. In this assignment, you won’t.\nIn this analysis, I look at median gross rent across counties in New York, and ask which communities we measure most and least reliably. I have chosen to look at the median gross rent people pay in New York as the state has the highest average rental costs in the world. I’m curious to see how this average changes across different counties and regions of the state.\n\nmy_state &lt;- \"36\"        # two-letter abbreviation, in quotes\nmy_variable &lt;- \"B25064_001\"     # the variable code, in quotes"
+  },
+  {
+    "objectID": "assignments/assignment2.html#pulling-the-data",
+    "href": "assignments/assignment2.html#pulling-the-data",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "Pulling the data",
+    "text": "Pulling the data\n\ncounty_data &lt;- get_acs(\n  geography = \"county\",\n  variables = my_variable,\n  state = my_state,\n  year = 2023,\n  survey = \"acs5\"\n)\n\nLet’s look at what came back.\n\ndim(county_data)\n\n[1] 62  5\n\nhead(county_data)\n\n# A tibble: 6 × 5\n  GEOID NAME                         variable   estimate   moe\n  &lt;chr&gt; &lt;chr&gt;                        &lt;chr&gt;         &lt;dbl&gt; &lt;dbl&gt;\n1 36001 Albany County, New York      B25064_001     1252    22\n2 36003 Allegany County, New York    B25064_001      754    33\n3 36005 Bronx County, New York       B25064_001     1436    11\n4 36007 Broome County, New York      B25064_001      914    26\n5 36009 Cattaraugus County, New York B25064_001      759    30\n6 36011 Cayuga County, New York      B25064_001      895    39\n\n\nThe dataframe has 62 rows, which matches the number of counties in the state New York.\n\ncounty_data &lt;- county_data %&gt;%\n  mutate(moe_pct = moe / estimate * 100)\n\n\ncounty_data %&gt;%\n  arrange(desc(moe_pct)) %&gt;%\n  select(NAME, estimate, moe, moe_pct) %&gt;%\n  head(10)\n\n# A tibble: 10 × 4\n   NAME                        estimate   moe moe_pct\n   &lt;chr&gt;                          &lt;dbl&gt; &lt;dbl&gt;   &lt;dbl&gt;\n 1 Hamilton County, New York        860    95   11.0 \n 2 Schuyler County, New York        858    75    8.74\n 3 Greene County, New York          993    79    7.96\n 4 Lewis County, New York           821    59    7.19\n 5 Orleans County, New York         877    60    6.84\n 6 Yates County, New York           802    46    5.74\n 7 Wyoming County, New York         782    44    5.63\n 8 Cortland County, New York        911    50    5.49\n 9 Chenango County, New York        819    44    5.37\n10 Livingston County, New York      912    48    5.26\n\n\nHamilton County has the largest margin of error relative to its estimate. The raw MOE is 95, while the MOE percentage relative to its estimate is 11.04."
+  },
+  {
+    "objectID": "assignments/assignment2.html#sorting-counties-into-reliability-categories",
+    "href": "assignments/assignment2.html#sorting-counties-into-reliability-categories",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "Sorting counties into reliability categories",
+    "text": "Sorting counties into reliability categories\n\ncounty_data &lt;- county_data %&gt;%\n  mutate(reliability = case_when(\n    moe_pct &lt; 5  ~ \"High confidence\",\n    moe_pct &lt; 10 ~ \"Moderate\",\n    TRUE         ~ \"Low confidence\"\n  ))\n\ncount(county_data, reliability)\n\n# A tibble: 3 × 2\n  reliability         n\n  &lt;chr&gt;           &lt;int&gt;\n1 High confidence    51\n2 Low confidence      1\n3 Moderate           10\n\n\n51 counties fall into high confidence, 10 into moderate confidence and 1 into low confidence."
+  },
+  {
+    "objectID": "assignments/assignment2.html#is-the-margin-of-error-bigger-in-small-places",
+    "href": "assignments/assignment2.html#is-the-margin-of-error-bigger-in-small-places",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "Is the margin of error bigger in small places?",
+    "text": "Is the margin of error bigger in small places?\n\ncounty_wide &lt;- get_acs(\n  geography = \"county\",\n  variables = c(myvar = my_variable,\n                pop   = \"B01003_001\"),\n  state = my_state,\n  year = 2023,\n  survey = \"acs5\",\n  output = \"wide\"\n)\n\nhead(county_wide)\n\n# A tibble: 6 × 6\n  GEOID NAME                         myvarE myvarM    popE  popM\n  &lt;chr&gt; &lt;chr&gt;                         &lt;dbl&gt;  &lt;dbl&gt;   &lt;dbl&gt; &lt;dbl&gt;\n1 36001 Albany County, New York        1252     22  315374    NA\n2 36003 Allegany County, New York       754     33   47027    NA\n3 36005 Bronx County, New York         1436     11 1419250    NA\n4 36007 Broome County, New York         914     26  197738    NA\n5 36009 Cattaraugus County, New York    759     30   76479    NA\n6 36011 Cayuga County, New York         895     39   75464    NA\n\n\n\ncounty_wide &lt;- county_wide %&gt;%\n  mutate(moe_pct = myvarM / myvarE * 100) %&gt;%\n  mutate(reliability = case_when(\n    moe_pct &lt; 5  ~ \"High confidence\",\n    moe_pct &lt; 10 ~ \"Moderate\",\n    TRUE         ~ \"Low confidence\"\n  ))\n\nNow compare the average population of counties in each reliability category.\n\ncounty_wide %&gt;%\n  group_by(reliability) %&gt;%\n  summarize(\n    n_counties = n(),\n    avg_population = mean(popE)\n  )\n\n# A tibble: 3 × 3\n  reliability     n_counties avg_population\n  &lt;chr&gt;                &lt;int&gt;          &lt;dbl&gt;\n1 High confidence         51        381479.\n2 Low confidence           1          5102 \n3 Moderate                10         41178.\n\n\nBased on the size of the margin of error relative to its estimate (moe_pct), three buckets of reliability were created: high confidence (moe_pct&lt;5), moderate confidence (moe_pct&lt;10) and low confidence (moe_pct&gt;=10). 51 counties fall into high confidence, 10 into moderate and 1 into low confidence.\nA clear pattern can be observed across the three buckets: as me move from high to moderate to low confidence, the average population of these counties also falls.\nSpecifically, the average population of high confidence counties is 381,479, 41,178 for moderate confidence counties, and 5,102 for the low confidence one.\nThe data seems to suggest that smaller counties may be more likely to have higher margin of error relative to the underlying estimate."
+  },
+  {
+    "objectID": "assignments/assignment2.html#what-this-means-for-policy",
+    "href": "assignments/assignment2.html#what-this-means-for-policy",
+    "title": "Assignment 2: Who Do We Know the Least About?",
+    "section": "What this means for policy",
+    "text": "What this means for policy\nWhen looking at county-wise median gross rental payments in the state of New York, we know the least about Hamilton County. This is based on the size of the margin of error relative to its corresponding estimate. Hamilton County has both the highest margin of error in absolute terms and the highest margin of error relative to the estimate: an MOE of 95 and an MOE of 11% relative to the estimate.\nThis is a function of its small population size and the sampling strategy used in the ACS. Data for the present analysis is drawn from ACS, which is based on sample surveys. These surveys draw smaller samples from less populous counties and larger samples from more populous ones. Counties such as Putnam County or Greene County have an MOE of 80 and 79, respectively, but their MOE percentages are 4.4 and 7.96, respectively. While their MOEs are 84% (Putnam) and 83% (Greene) of Hamilton’s, their MOE percentages are only 40% and 72% of Hamilton. This is because their respective populations are substantially bigger than Hamilton’s 5,102 people – with Putnam at 97,988 and Greene at 48,554.\nIf the state of New York or federal agencies were to use data from the ACS to devise policies related to rental housing, then it could be very inaccurate for smaller counties such as Hamilton County. Specifically, if the estimate reflects the lower end of the true rent being paid in Hamilton, then policies would end up underserving people who pay higher rents. Thus, before any action is taken, it would be advisable to conduct specific surveys in smaller counties or triangulate the estimate with county-specific administrative data."
   },
   {
     "objectID": "index.html",
