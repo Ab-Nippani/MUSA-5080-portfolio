@@ -1,0 +1,687 @@
+---
+title: "Assignment: Building Features, Watching What Happens"
+subtitle: "MUSA 5080 · Integrates Weeks 1–5 · Due Friday, October 16"
+author: "Abishek Nippani"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+freeze: false
+---
+
+## Part 0: Setup
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(caret)
+
+Sys.getenv("CENSUS_API_KEY") != ""
+```
+
+### The cross-validation helper
+
+```{r}
+#| label: cv-helper
+ctrl <- trainControl(method = "cv", number = 10)
+
+cv_rmse <- function(formula, data) {
+  df <- if (inherits(data, "sf")) st_drop_geometry(data) else data
+  vars <- all.vars(formula)
+  bad <- vars[sapply(vars, function(v) any(is.na(df[[v]])))]
+  if (length(bad) > 0) {
+    stop("These variables have NAs: ", paste(bad, collapse = ", "),
+         ". Fill them or choose another variable (Rule 1: don't drop rows).")
+  }
+  set.seed(5080)
+  fit <- train(formula, data = df, method = "lm", trControl = ctrl)
+  fit$results$RMSE
+}
+```
+
+### The model log
+
+```{r}
+#| label: log-start
+model_log <- tibble(
+  model   = character(),
+  added   = character(),
+  cv_rmse = numeric(),
+  notes   = character()
+)
+```
+
+---
+
+## Part 1: Choose your outcome
+
+The outcome is the **share of households with no vehicle available**, built from table B08201. The numerator is households with no vehicle (B08201_002) and the denominator is all households (B08201_001). Using households rather than total population as the denominator matters for the same reason the poverty universe mattered in Assignment 3: vehicle availability is recorded for households, so people in group quarters are not part of the universe, and dividing by total population would bias the rate downwards in tracts with dormitories or institutions.
+
+For the baseline, we choose four ACS predictors that plausibly relate to car ownership without being built from it:
+
+- **Median household income** (B19013_001): a car is expensive to own, so lower-income households are more likely to go without one.
+- **Share of households renting** (B25003_003 / B25003_001): renters are concentrated in denser rowhouse and apartment neighbourhoods where parking is scarce and a car is less necessary.
+- **Share of adults 25+ with a bachelor's degree or higher** (B15003_022 to _025): this separates two very different car-free populations, lower-income households who cannot afford a car and higher-educated downtown households who choose not to own one.
+- **Median age** (B01002_001): older residents and young adults have different mobility needs and licensing rates.
+
+We deliberately leave out the share of workers commuting by transit, walking or cycling (B08301). These are strongly related to the outcome, but they largely measure the same constraint from the other side: a household without a car commutes by transit because it has no car. An agency trying to predict car-free households would very likely not have commute-mode data without also having vehicle data, so including it would fail the Rule 3 test.
+
+### 1A: Pull your outcome and your baseline predictors
+
+```{r}
+#| label: pull
+#| results: hide
+options(tigris_use_cache = TRUE)
+philly_tracts <- get_acs(
+  geography = "tract",
+  state = "PA",
+  county = "Philadelphia",
+  variables = c(
+    total_pop  = "B01003_001",
+    hh         = "B08201_001",
+    no_veh     = "B08201_002",
+    med_income = "B19013_001",
+    tenure_tot = "B25003_001",
+    renter     = "B25003_003",
+    edu_tot    = "B15003_001",
+    ba         = "B15003_022",
+    ma         = "B15003_023",
+    prof       = "B15003_024",
+    phd        = "B15003_025",
+    med_age    = "B01002_001"
+  ),
+  year = 2023,
+  output = "wide",
+  geometry = TRUE
+) %>%
+  st_transform(2272)
+```
+
+```{r}
+#| label: build-outcome
+philly_tracts <- philly_tracts %>%
+  mutate(
+    # outcome: % of households with no vehicle, and its reliability
+    y     = no_vehE / hhE * 100,
+    y_moe = moe_prop(no_vehE, hhE, no_vehM, hhM) * 100,
+    y_cv  = (y_moe / 1.645) / y * 100,
+
+    # baseline predictors
+    med_income = med_incomeE,
+    pct_renter = renterE / tenure_totE * 100,
+    pct_ba     = (baE + maE + profE + phdE) / edu_totE * 100,
+    med_age    = med_ageE
+  )
+```
+
+### 1B: Is it reliable enough to model?
+
+```{r}
+#| label: reliability
+sum(is.na(philly_tracts$y))
+
+summary(philly_tracts$y_cv)
+
+philly_tracts %>%
+  mutate(reliability = case_when(
+    is.na(y)   ~ "No households",
+    y_cv < 12  ~ "High",
+    y_cv <= 40 ~ "Moderate",
+    TRUE       ~ "Low"
+  )) %>%
+  st_drop_geometry() %>%
+  count(reliability)
+
+ggplot(philly_tracts %>% filter(!is.na(y)), aes(x = y)) +
+  geom_histogram(bins = 30) +
+  labs(x = "Households with no vehicle (%)", y = "Tracts") +
+  theme_minimal()
+```
+
+Because the coefficient of variation divides by the estimate itself, low car-free shares look unreliable even when the margin of error is modest in percentage-point terms. We check whether the low-reliability tracts are simply the low-share tracts.
+
+```{r}
+#| label: reliability-by-level
+philly_tracts %>%
+  st_drop_geometry() %>%
+  filter(!is.na(y)) %>%
+  mutate(reliability = case_when(
+    y_cv < 12  ~ "High",
+    y_cv <= 40 ~ "Moderate",
+    TRUE       ~ "Low"
+  )) %>%
+  group_by(reliability) %>%
+  summarise(n_tracts      = n(),
+            median_share  = round(median(y), 1),
+            median_moe_pp = round(median(y_moe), 1))
+```
+
+**Answer:** The outcome is the share of households in each tract with no vehicle available. A transit agency or the City's Office of Transportation would want to predict it because car-free households depend entirely on transit, walking and cycling to reach jobs, groceries and health care, so knowing where they are guides where service cuts would hurt most and where new bus routes or bike-share stations would do the most good. Reliability is acceptable. Of the 388 tracts with households, 29 are high, 313 moderate and 46 low, with a median CV of 23.4%; a further 20 tracts have no households, so no rate exists for them. As in Assignment 3, low reliability here says more about the size of the estimate than the size of the error. The 46 low-reliability tracts have a median car-free share of just 6.0%, yet their median margin of error is 5.1 percentage points, the *smallest* of the three groups (against 9.7 for moderate and 8.2 for high). A handful of tracts with no car-free households at all have an infinite CV for the same reason. Since only about 12% of tracts are low reliability, well under the one-third threshold, we proceed with this outcome.
+
+### 1C: Decide which tracts to model
+
+```{r}
+#| label: filter
+tracts <- philly_tracts %>%
+  filter(total_popE > 0,
+         !is.na(y),
+         !is.na(med_income),
+         !is.na(pct_renter),
+         !is.na(pct_ba),
+         !is.na(med_age))
+
+nrow(philly_tracts)
+nrow(tracts)
+```
+
+```{r}
+#| label: dropped
+philly_tracts %>%
+  st_drop_geometry() %>%
+  filter(!GEOID %in% tracts$GEOID) %>%
+  mutate(tract = str_extract(NAME, "Tract [^;]+")) %>%
+  select(tract, total_popE, hhE, med_income) %>%
+  arrange(desc(hhE))
+```
+
+**Answer:** We lose 27 of 408 tracts, leaving 381. Twenty of them have no households at all, so the outcome is a division of zero by zero and is undefined rather than missing. As in Assignment 3, most of these belong to the 98xx series, which the Census Bureau uses for parks, the airport and other largely non-residential land. Three of them, tracts 9891, 9893 and 369.01, do have residents (1,240, 160 and 49 people) but no households, so everyone there lives in group quarters such as institutions or dormitories, which sit outside the household universe the outcome is built on.
+
+The remaining seven are a different problem. Each has households but no published median income. One of them, tract 9802, has only 13 households and a median age of 75, which points to a care facility, and dropping it costs nothing. The other six (tracts 148, 165, 205, 277, 285 and 301) are ordinary residential tracts with between 525 and 2,642 households, and their missing income is a gap in the published data rather than an absence of people. We follow the template and exclude them, but this is a real cost: these are exactly the kind of tracts an agency would want a prediction for. Filling their income with the citywide median, flagged with a dummy, would be the obvious alternative and is worth testing in a later version.
+
+---
+
+## Part 2: Baseline model
+
+### 2A: Look first
+
+```{r}
+#| label: look
+#| fig-height: 6
+tracts %>%
+  st_drop_geometry() %>%
+  select(y, med_income, pct_renter, pct_ba, med_age) %>%
+  pivot_longer(-y, names_to = "predictor", values_to = "value") %>%
+  ggplot(aes(x = value, y = y)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, colour = "red") +
+  geom_smooth(method = "loess", se = FALSE, colour = "grey40", linetype = "dashed") +
+  facet_wrap(~ predictor, scales = "free_x") +
+  labs(x = NULL, y = "Households with no vehicle (%)",
+       caption = "Red: straight line. Grey dashed: smoothed curve.") +
+  theme_minimal()
+```
+
+The red line is what a linear model can see; the grey curve is what the data actually do. Where the two diverge, a transformation in Part 5 may help. Three things stand out. Income bends sharply: the car-free share falls steeply up to a median income of roughly $75,000 and is flat, or even rising slightly, above $100,000, which already suggests a log. Education is U-shaped: car-free shares are high in tracts with few graduates, lowest around 30%, and high again where most adults hold a degree. This is the two car-free populations from Part 1 showing up in the data, and it explains why the straight red line for education is nearly flat. Renter share, by contrast, is close to linear, and the red and grey lines almost coincide.
+
+### 2B: Fit and log
+
+```{r}
+#| label: m1
+f1 <- y ~ med_income + pct_renter + pct_ba + med_age
+
+m1 <- lm(f1, data = tracts)
+summary(m1)
+
+model_log <- model_log %>%
+  add_row(model = "m1", added = "ACS baseline",
+          cv_rmse = cv_rmse(f1, tracts),
+          notes = "income, renter share, BA+ share, median age")
+
+model_log
+```
+
+On tracts it hasn't seen, the baseline model misses by about **12.4 percentage points** of households with no vehicle. With most tracts' car-free share somewhere between about 10% and 40%, that is a substantial error: the model can place a tract in the right half of the distribution, but not much more. Its in-sample R² of 0.43 tells the same story.
+
+### 2C: Where is the baseline wrong?
+
+```{r}
+#| label: resid-map-1
+tracts <- tracts %>% mutate(resid_m1 = residuals(m1))
+
+ggplot(tracts) +
+  geom_sf(aes(fill = resid_m1), color = NA) +
+  scale_fill_gradient2(low = "#2166ac", mid = "grey95", high = "#b2182b", midpoint = 0) +
+  theme_void() +
+  labs(title = "Baseline model: where it's wrong",
+       subtitle = "Red = actual higher than predicted",
+       fill = "Residual (pp)")
+```
+
+**Answer:** The residuals are not scattered randomly. The model under-predicts (red) in a continuous band around the centre: Center City and the rowhouse blocks of South Philadelphia, where the single largest miss sits, North Philadelphia, and much of West Philadelphia. In these places more households go without a car than their income and tenure alone would suggest. It over-predicts (blue) almost everywhere in the Northeast and Northwest, and along the far Southwest, where households of similar income still own cars. What these places have in common is something the ACS baseline cannot see: **how easy it is to live without a car**. Density, closeness to the centre, and the availability of alternatives such as bike share all make car ownership less necessary, while the outer neighbourhoods are built around driving. Part 3 therefore pulls layers that capture the presence of cars on the street and access to alternatives.
+
+---
+
+## Part 3: Getting data from Philadelphia's open data portal
+
+```{r}
+#| label: carto-helper
+# Encode every special character (including the % in LIKE patterns), and retry
+# a few times, because the Carto server occasionally drops a connection.
+carto_url <- function(sql, format) {
+  paste0("https://phl.carto.com/api/v2/sql?format=", format,
+         "&q=", URLencode(sql, reserved = TRUE))
+}
+
+with_retry <- function(f, tries = 3) {
+  for (i in seq_len(tries)) {
+    out <- tryCatch(f(), error = function(e) e)
+    if (!inherits(out, "error")) return(out)
+    message("Carto request failed (attempt ", i, "): ", conditionMessage(out))
+    Sys.sleep(3 * i)
+  }
+  stop(out)
+}
+
+carto_get <- function(sql) with_retry(function() st_read(carto_url(sql, "GeoJSON"), quiet = TRUE))
+carto_csv <- function(sql) with_retry(function() read_csv(carto_url(sql, "csv"), show_col_types = FALSE))
+```
+
+Before filtering on offense types and 311 service names, we check the exact labels the tables use.
+
+```{r}
+#| label: explore-values
+carto_csv("SELECT text_general_code, COUNT(*) AS n
+           FROM incidents_part1_part2
+           WHERE dispatch_date >= '2023-01-01' AND dispatch_date < '2024-01-01'
+           GROUP BY text_general_code ORDER BY n DESC")
+
+carto_csv("SELECT service_name, COUNT(*) AS n
+           FROM public_cases_fc
+           WHERE requested_datetime >= '2023-01-01' AND requested_datetime < '2024-01-01'
+             AND service_name ILIKE '%vehicle%'
+           GROUP BY service_name ORDER BY n DESC")
+```
+
+### Our layers
+
+We pull three layers, all from 2023 so they sit inside the ACS window. Each is an indirect measure of **how many cars are on a tract's streets**, which is the thing the baseline cannot see.
+
+```{r}
+#| label: my-layers
+# 1. Motor vehicle thefts, 2023
+veh_theft <- carto_get(
+  "SELECT the_geom, text_general_code, dispatch_date
+   FROM incidents_part1_part2
+   WHERE dispatch_date >= '2023-01-01' AND dispatch_date < '2024-01-01'
+     AND text_general_code = 'Motor Vehicle Theft'"
+) %>%
+  st_transform(st_crs(tracts))
+
+# 2. Thefts from vehicles, 2023
+theft_from_veh <- carto_get(
+  "SELECT the_geom, text_general_code, dispatch_date
+   FROM incidents_part1_part2
+   WHERE dispatch_date >= '2023-01-01' AND dispatch_date < '2024-01-01'
+     AND text_general_code = 'Theft from Vehicle'"
+) %>%
+  st_transform(st_crs(tracts))
+
+# 3. 311 abandoned vehicle requests, 2023
+abandoned <- carto_get(
+  "SELECT the_geom, service_name, requested_datetime
+   FROM public_cases_fc
+   WHERE requested_datetime >= '2023-01-01' AND requested_datetime < '2024-01-01'
+     AND service_name = 'Abandoned Vehicle'"
+) %>%
+  st_transform(st_crs(tracts))
+
+# 4. Indego stations (Week 4 feed)
+stations <- st_read("https://www.rideindego.com/stations/json/", quiet = TRUE) %>%
+  st_transform(st_crs(tracts))
+```
+
+Some records come back without a location. We drop them and count the loss, since every dropped point is an event that will not be counted in any tract.
+
+```{r}
+#| label: empty-geoms
+layers <- list(veh_theft = veh_theft, theft_from_veh = theft_from_veh,
+               abandoned = abandoned, stations = stations)
+
+tibble(layer   = names(layers),
+       pulled  = map_int(layers, nrow),
+       no_geom = map_int(layers, ~ sum(st_is_empty(.x))))
+
+veh_theft      <- veh_theft      %>% filter(!st_is_empty(.))
+theft_from_veh <- theft_from_veh %>% filter(!st_is_empty(.))
+abandoned      <- abandoned      %>% filter(!st_is_empty(.))
+stations       <- stations       %>% filter(!st_is_empty(.))
+```
+
+**Answer:** The baseline knows who lives in a tract but not what the streets look like. A car that does not exist cannot be stolen, broken into or abandoned, so vehicle-related crime and 311 complaints work as indirect counts of the cars present in a place, information the ACS predictors only capture through income. We expect motor vehicle theft and thefts from vehicles to be higher where more cars are parked on the street, and abandoned-vehicle complaints to mark neighbourhoods where car ownership is common enough that disused cars accumulate. Indego stations capture the opposite side: the availability of an alternative to driving.
+
+Two caveats are worth stating up front. First, vehicle crime also reflects where people *drive to*, not only where they live: Center City has many thefts from vehicles because commuters and visitors park there, which may weaken the link to residents' car ownership. Second, 2023 motor vehicle thefts were inflated by the Kia and Hyundai theft wave, which targeted particular models rather than places with more cars. Finally, the Indego feed returns today's stations rather than the 2023 network, so it uses a little information from the future (Rule 2). Any stations opened since 2023 make this feature slightly optimistic; a historical station list would be the clean fix.
+
+---
+
+## Part 4: Building spatial features
+
+We build the features once, then add them to the model one at a time so each row of the log isolates one change.
+
+```{r}
+#| label: build-features
+tract_pts <- st_point_on_surface(tracts)
+
+city_hall <- st_sfc(st_point(c(-75.1636, 39.9526)), crs = 4326) %>%
+  st_transform(st_crs(tracts))
+
+nearest_idx <- st_nearest_feature(tract_pts, stations)
+
+tracts <- tracts %>%
+  mutate(
+    area_sqmi = as.numeric(st_area(.)) / 27878400,
+
+    # counts
+    n_veh_theft      = lengths(st_intersects(., veh_theft)),
+    n_theft_from_veh = lengths(st_intersects(., theft_from_veh)),
+    n_abandoned      = lengths(st_intersects(., abandoned)),
+
+    # densities
+    veh_theft_per_1k_hh  = n_veh_theft / hhE * 1000,
+    theft_from_veh_sqmi  = n_theft_from_veh / area_sqmi,
+    abandoned_per_1k_hh  = n_abandoned / hhE * 1000,
+    pop_per_sqmi         = total_popE / area_sqmi,
+
+    # distances
+    dist_station_mi = as.numeric(
+      st_distance(tract_pts, stations[nearest_idx, ], by_element = TRUE)) / 5280,
+    dist_ch_mi = as.numeric(st_distance(tract_pts, city_hall)) / 5280
+  )
+
+tracts %>%
+  st_drop_geometry() %>%
+  select(veh_theft_per_1k_hh, theft_from_veh_sqmi, abandoned_per_1k_hh,
+         pop_per_sqmi, dist_station_mi, dist_ch_mi) %>%
+  summary()
+```
+
+Vehicle thefts and abandoned vehicles are normalised by **households**, since they are rough proxies for the number of household cars. Thefts from vehicles are normalised by **area**, because many of the victims' cars belong to visitors rather than residents, so a per-household rate would be meaningless in commercial tracts. Because every count is filled with 0 where nothing was recorded, no row is lost (Rule 1).
+
+As the Week 3 lesson on small denominators warns, per-household rates can explode in tracts with very few households. We check the extremes before trusting them.
+
+```{r}
+#| label: small-denominators
+tracts %>%
+  st_drop_geometry() %>%
+  arrange(desc(veh_theft_per_1k_hh)) %>%
+  select(NAME, hhE, n_veh_theft, veh_theft_per_1k_hh, n_abandoned, abandoned_per_1k_hh) %>%
+  head(8)
+```
+
+Only one tract is a genuine small-denominator problem: Census Tract 9801, where 11 thefts among 66 households produce the city's highest rate of 167 per 1,000. The next seven tracts have between 317 and 1,375 households and 30 to 123 thefts each, so their high rates rest on real volume rather than tiny denominators. Even so, the distribution is long-tailed, which is a reason to expect the log in Part 5 to help.
+
+### 4E: Adding features one at a time
+
+Each model adds one feature to the one before.
+
+```{r}
+#| label: my-spatial
+base <- c("med_income", "pct_renter", "pct_ba", "med_age")
+
+steps <- list(
+  m2 = list(add = "veh_theft_per_1k_hh", label = "vehicle thefts per 1k households (density)"),
+  m3 = list(add = "theft_from_veh_sqmi", label = "thefts from vehicles per sq mi (density)"),
+  m4 = list(add = "abandoned_per_1k_hh", label = "abandoned-vehicle 311 per 1k households (density)"),
+  m5 = list(add = "dist_station_mi",     label = "distance to nearest Indego station (nearest)"),
+  m6 = list(add = "dist_ch_mi",          label = "distance to City Hall (place)"),
+  m7 = list(add = "pop_per_sqmi",        label = "population per sq mi (density)")
+)
+
+terms <- base
+for (m in names(steps)) {
+  terms <- c(terms, steps[[m]]$add)
+  f <- reformulate(terms, response = "y")
+  model_log <- model_log %>%
+    add_row(model = m, added = steps[[m]]$label,
+            cv_rmse = cv_rmse(f, tracts),
+            notes = "cumulative")
+}
+
+model_log %>%
+  mutate(change = cv_rmse - lag(cv_rmse))
+```
+
+Because features are added cumulatively, the order matters: a feature added late can look useless because an earlier one already carried its information. To check this, we also add each feature to the baseline **on its own**.
+
+```{r}
+#| label: one-at-a-time
+alone <- map_dfr(steps, function(s) {
+  tibble(feature = s$label,
+         cv_rmse = cv_rmse(reformulate(c(base, s$add), response = "y"), tracts))
+}) %>%
+  mutate(vs_baseline = cv_rmse - model_log$cv_rmse[model_log$model == "m1"]) %>%
+  arrange(cv_rmse)
+
+alone
+```
+
+**Answer:** Distance to City Hall helped most. Added to the baseline on its own, it lowered CV RMSE from 12.44 to 10.27 points, a cut of 2.17; added in sequence after the Indego feature, it still took off a further 1.47. This fits the baseline residual map: the largest misses followed distance from the centre, and distance from the centre is a summary of everything that makes going without a car practical, from jobs and shops within walking distance to the densest transit service.
+
+The comparison between the two tables is itself instructive. On its own, distance to the nearest Indego station cut CV RMSE by 1.14 and population density by 1.05, but in sequence density added only 0.16. All three features largely measure the same thing, centrality. The Indego network is concentrated in and around Center City (the median tract is a third of a mile from a station, but the mean is 1.7 miles and the furthest tract is 11 miles away), so outside the core, distance to the nearest station is mostly distance to the centre under another name.
+
+The disappointment was the vehicle-crime and 311 layers. Motor vehicle thefts made the model slightly *worse* (CV RMSE rose by 0.03 on its own), and thefts from vehicles and abandoned-vehicle complaints each improved it by less than 0.05 points. We expected a car that does not exist to be impossible to steal, but two things got in the way. First, thefts from vehicles follow where cars are *parked*, which in the centre means commuters' and shoppers' cars rather than residents'. Second, 2023 was the peak of the Kia and Hyundai theft wave, so motor vehicle thefts track where particular models were parked rather than how many cars there were. A small rise in CV RMSE is itself a finding: a predictor that carries no new information still costs the model a parameter, and cross-validation penalises that where in-sample R² would not.
+
+---
+
+## Part 5: Transforming features
+
+Following the October 9 lecture, the outcome stays in percentage points so every row of the log is comparable; only predictors are transformed. We start from the full m7 specification and change one thing at a time.
+
+### 5A: Logs
+
+The Part 2A plots showed income bending, and the Part 4 summary showed density and the crime rates are heavily right-skewed: most tracts have modest values and a handful have very large ones.
+
+```{r}
+#| label: log-look
+#| fig-height: 3.5
+tracts %>%
+  st_drop_geometry() %>%
+  select(med_income, pop_per_sqmi, veh_theft_per_1k_hh) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) + geom_histogram(bins = 30) +
+  facet_wrap(~ name, scales = "free") + theme_minimal() +
+  labs(title = "Raw", x = NULL)
+
+tracts %>%
+  st_drop_geometry() %>%
+  transmute(log_income = log(med_income),
+            log1p_density = log1p(pop_per_sqmi),
+            log1p_veh_theft = log1p(veh_theft_per_1k_hh)) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) + geom_histogram(bins = 30) +
+  facet_wrap(~ name, scales = "free") + theme_minimal() +
+  labs(title = "Logged", x = NULL)
+```
+
+Income is always positive, so it takes a plain `log()`. The density and crime rates can be zero, so they take `log1p()`.
+
+```{r}
+#| label: my-logs
+spec7 <- c(base, map_chr(steps, "add"))
+
+swap <- function(spec, old, new) c(setdiff(spec, old), new)
+
+spec_log_inc <- swap(spec7, "med_income", "log(med_income)")
+model_log <- model_log %>%
+  add_row(model = "m8", added = "log of median income",
+          cv_rmse = cv_rmse(reformulate(spec_log_inc, response = "y"), tracts),
+          notes = "replaces linear income in m7")
+
+spec_log_dens <- swap(spec_log_inc, "pop_per_sqmi", "log1p(pop_per_sqmi)")
+model_log <- model_log %>%
+  add_row(model = "m9", added = "log1p of population density",
+          cv_rmse = cv_rmse(reformulate(spec_log_dens, response = "y"), tracts),
+          notes = "builds on m8")
+
+spec_log_crime <- spec_log_dens %>%
+  swap("veh_theft_per_1k_hh", "log1p(veh_theft_per_1k_hh)") %>%
+  swap("abandoned_per_1k_hh", "log1p(abandoned_per_1k_hh)") %>%
+  swap("theft_from_veh_sqmi", "log1p(theft_from_veh_sqmi)")
+model_log <- model_log %>%
+  add_row(model = "m10", added = "log1p of the three vehicle-crime/311 rates",
+          cv_rmse = cv_rmse(reformulate(spec_log_crime, response = "y"), tracts),
+          notes = "builds on m9")
+
+model_log %>% tail(4)
+```
+
+### 5B: Squared term
+
+Distance to City Hall is the obvious candidate for a curve: car-free shares should fall quickly as one leaves the core and then level off in the outer neighbourhoods, where nearly everyone drives.
+
+```{r}
+#| label: my-squared
+ggplot(tracts, aes(x = dist_ch_mi, y = y)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, colour = "grey40", linetype = "dashed") +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^2), se = FALSE, colour = "red") +
+  labs(x = "Distance to City Hall (miles)", y = "Households with no vehicle (%)",
+       caption = "Grey dashed: straight line. Red: with squared term.") +
+  theme_minimal()
+
+best_log <- spec_log_crime   # m10 had the lowest CV RMSE of the log models
+
+spec_sq <- c(best_log, "I(dist_ch_mi^2)")
+model_log <- model_log %>%
+  add_row(model = "m11", added = "squared distance to City Hall",
+          cv_rmse = cv_rmse(reformulate(spec_sq, response = "y"), tracts),
+          notes = "linear + squared distance")
+```
+
+### 5C: Categorical variable
+
+Instead of a smooth curve, we can treat distance as rings around the centre. Planners already talk about the city this way, and a ring does not assume the relationship has any particular shape.
+
+```{r}
+#| label: my-categorical
+tracts <- tracts %>%
+  mutate(
+    ring = case_when(
+      dist_ch_mi < 2 ~ "Core",
+      dist_ch_mi < 5 ~ "Inner",
+      TRUE           ~ "Outer"
+    ),
+    ring = factor(ring, levels = c("Core", "Inner", "Outer"))
+  )
+
+tracts %>% st_drop_geometry() %>% count(ring)
+
+spec_ring <- c(setdiff(best_log, "dist_ch_mi"), "ring")
+model_log <- model_log %>%
+  add_row(model = "m12", added = "ring (Core / Inner / Outer) instead of distance",
+          cv_rmse = cv_rmse(reformulate(spec_ring, response = "y"), tracts),
+          notes = "reference level = Core")
+
+m_ring <- lm(reformulate(spec_ring, response = "y"), data = tracts)
+summary(m_ring)$coefficients[c("ringInner", "ringOuter"), ]
+
+model_log
+```
+
+All three rings have well over 20 tracts, so every cross-validation fold will contain each category.
+
+**Answer:** The log of median income helped most, lowering CV RMSE from 9.62 to 9.22 points. This matches the scatterplot in Part 2A: the car-free share falls steeply across the lowest incomes and then flattens, so a straight line was overstating the effect of income among better-off tracts and understating it among the poorest. A log says that going from $20,000 to $40,000 matters as much as going from $60,000 to $120,000, which is closer to how car ownership actually works.
+
+Not every log helped. Logging population density made the model *worse* (9.22 to 9.44), most likely because distance to City Hall was already capturing the shape of density's effect, and compressing density's upper tail removed the one thing it added: the difference between the very densest central tracts and the merely dense ones. Logging the three vehicle-crime and 311 rates, by contrast, took CV RMSE down to 9.14, the lowest so far. These features did almost nothing as raw rates in Part 4 but earned their place once logged, because the log stopped a handful of extreme tracts from dominating their coefficients. The squared distance term took CV RMSE to 9.00, the best of any model. Its plot shows why: a straight line keeps falling until it predicts negative car-free shares at the city's edge, while the curve levels off at around 5%, which is what the outer tracts actually show. The ring variable did worse (9.31) than the continuous distance it replaced. Three categories throw away the variation *within* each ring, and within the Core in particular, car-free shares range from about 20% to nearly 80%.
+
+Reading the categorical variable, with **Core** (within two miles of City Hall) as the reference level: holding income, tenure, education, age, density and the vehicle-crime features constant, a tract in the **Outer** ring is predicted to have about 15.0 percentage points fewer households without a car than an otherwise similar tract in the Core (and an **Inner** tract about 8.3 points fewer).
+
+---
+
+## Part 6: Your final model
+
+We keep the features and transformations that lowered CV RMSE, judged by the model log rather than by p-values.
+
+```{r}
+#| label: final
+# m11 without thefts from vehicles, which never lowered CV RMSE by more than 0.05
+f_final <- y ~ log(med_income) + pct_renter + pct_ba + med_age +
+  log1p(veh_theft_per_1k_hh) + log1p(abandoned_per_1k_hh) +
+  dist_station_mi + log1p(pop_per_sqmi) +
+  dist_ch_mi + I(dist_ch_mi^2)
+
+m_final <- lm(f_final, data = tracts)
+summary(m_final)
+
+model_log <- model_log %>%
+  add_row(model = "final", added = "m11 minus thefts from vehicles",
+          cv_rmse = cv_rmse(f_final, tracts),
+          notes = "m11 without thefts from vehicles")
+
+model_log %>%
+  mutate(vs_baseline = round(cv_rmse - first(cv_rmse), 2)) %>%
+  select(model, added, cv_rmse, vs_baseline) %>%
+  print(n = Inf, width = Inf)
+```
+
+The final model is m11 with one feature removed: thefts from vehicles, which never improved CV RMSE by more than 0.05 in any step. Dropping it costs 0.01 (9.00 to 9.01), well within what a different fold split would produce, so we keep the simpler model. On tracts it hasn't seen, the final model misses by about **9.0 percentage points**, compared with 12.4 for the baseline, a reduction of about 28%. In-sample R² rose from 0.43 to 0.71.
+
+### Where is the final model wrong?
+
+To compare the two maps fairly, they share one colour scale.
+
+```{r}
+#| label: resid-map-2
+#| fig-height: 5
+tracts <- tracts %>% mutate(resid_final = residuals(m_final))
+
+lim <- max(abs(c(tracts$resid_m1, tracts$resid_final)))
+
+tracts %>%
+  select(resid_m1, resid_final) %>%
+  pivot_longer(c(resid_m1, resid_final), names_to = "model", values_to = "resid") %>%
+  mutate(model = factor(model, levels = c("resid_m1", "resid_final"),
+                        labels = c("Baseline (m1)", "Final"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = resid), color = NA) +
+  scale_fill_gradient2(low = "#2166ac", mid = "grey95", high = "#b2182b",
+                       midpoint = 0, limits = c(-lim, lim)) +
+  facet_wrap(~ model) +
+  theme_void() +
+  labs(title = "Where the models are wrong",
+       subtitle = "Red = actual higher than predicted. Same colour scale in both panels.",
+       fill = "Residual (pp)")
+```
+
+The two clusters from Part 2C have largely gone. The deep red around Center City and South Philadelphia has faded to pale, and the blue blanket over the Northeast and Northwest has disappeared, which is what distance to the centre was brought in to fix. The errors now look more like a patchwork than a pattern, but two things remain. A narrow north–south band of red tracts in North Philadelphia stays red in both maps, and parts of West Philadelphia still carry red patches. Meanwhile a few tracts in South and Southwest Philadelphia have flipped to blue, and the lower Northeast along the Delaware has turned faintly red. The surviving misses are not explained by distance from the centre or density, which suggests the missing ingredient is more local.
+
+### Are the biggest misses in the least reliable tracts?
+
+```{r}
+#| label: fog
+tracts %>%
+  filter(is.finite(y_cv)) %>%
+  ggplot(aes(x = y_cv, y = abs(resid_final))) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(se = FALSE) +
+  labs(x = "CV of the outcome estimate (%)",
+       y = "Size of the miss (percentage points)") +
+  theme_minimal()
+
+tracts %>%
+  st_drop_geometry() %>%
+  summarise(
+    median_abs_resid = median(abs(resid_final)),
+    median_y_moe     = median(y_moe),
+    share_within_moe = mean(abs(resid_final) <= y_moe)
+  )
+```
+
+---
+
+## Part 7: Reflection
+
+The feature that helped most was distance to City Hall, which on its own cut the baseline's error by more than two points. The reason is the one the baseline residual map pointed to: the model knew *who* lived in a tract but not *where*. Income and tenure explain why a household might not afford a car; centrality explains whether it can manage without one. The most disappointing was motor vehicle theft, the only feature that made the model worse on its own. We expected car crime to stand in for car ownership, but in 2023 it mostly measured where Kias and Hyundais were parked. Vehicle crime did eventually earn a place, but only once logged, which says the signal was there and was being drowned out by a few extreme tracts.
+
+Reading one coefficient twice: in the final model, the coefficient on log median income is β̂ = −14.8. As a β̂ reading, a 1% increase in a tract's median income is associated with about 0.15 percentage points fewer car-free households, holding the other predictors constant. As a ŷ reading, the model predicts that of two otherwise identical tracts, one with a median income of $40,000 and one with $80,000, the richer tract would have about 10.3 percentage points fewer households without a car.
+
+What's still missing is **transit access**. The red band that survives in North Philadelphia is a set of tracts the model treats like their neighbours, but it appears to follow the Broad Street corridor, where a subway line makes life without a car far easier than distance from City Hall would suggest. Distance to the nearest Indego station is only a partial stand-in. SEPTA publishes its full schedule as GTFS, from which one could count trips per day at stops within a quarter mile of each tract, measuring not just whether transit exists but whether it comes often enough to live on.
+
+Some of the remaining error is not the model's fault at all. The final model misses the median tract by 5.4 percentage points, while the median margin of error on the outcome itself is 9.0 points, and 70% of tracts are predicted within their own margin of error. For most tracts, then, the model's miss is smaller than the survey's own uncertainty about the true value. The fog plot, however, shows no clear relationship between a tract's CV and the size of its miss. The largest misses, of 20 to 27 points, sit among tracts with CVs between 10% and 35%, and the wiggles in the smoothed line at high CVs are driven by a handful of points. So noise accounts for much of the *typical* error, and lowering CV RMSE much further would partly mean fitting noise, but the *biggest* misses are real failures of the model in tracts we measure reasonably well. Those are where the next feature should be aimed.
