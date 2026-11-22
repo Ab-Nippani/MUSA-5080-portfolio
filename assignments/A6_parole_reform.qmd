@@ -1,0 +1,518 @@
+---
+title: "Assignment 6: Parole Reform"
+subtitle: "MUSA 5080 · Fall 2026"
+author: "Abishek Nippani"
+date: today
+format:
+  html:
+    code-fold: show
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+freeze: false
+---
+
+# The scenario
+
+The Georgia Department of Community Supervision is considering a risk model to guide parole decisions. Every person released to parole would get a predicted probability of being **rearrested within three years**. The department has two proposed uses:
+
+- **Use A:** people above a threshold get **more restrictive supervision** (more check-ins, electronic monitoring, faster revocation).
+- **Use B:** people above a threshold get **priority for reentry services** (housing assistance, job placement, a case manager).
+
+The department has promised that the model **will not use race**. You've been hired to build it and to tell them whether that promise means what they think it means.
+
+**What you're turning in:** this rendered document, published in the `assignments/` folder of your portfolio.
+
+**How this assignment works:** it has less scaffolding than earlier ones. The **Week 11 lab** (COMPAS) is your fully worked example: almost every step here has a matching step there. Where the NIJ data behaves differently from COMPAS, the instructions below tell you. Everywhere else, adapt the lab code yourself.
+
+| A5 part | Week 11 lab step |
+|---|---|
+| 3.1 odds ratios | Step 3 |
+| 4.1 predictions + confusion matrix | Steps 4–5 |
+| 4.3 threshold sweep | Step 5 (`rates_at()`) |
+| 4.4 ROC + AUC | Step 6 |
+| 5.1–5.2 errors by race | Step 7 |
+| 5.3 what carries race in | Step 8 |
+
+Two differences from the lab: the outcome is called **`recid`** (not `two_year_recid`), and you **fit on `train` and evaluate on `test`**. In the lab we fit and scored on the same data. So every `predict()` in Parts 4 and 5 needs `newdata = test`.
+
+
+# The data
+
+The National Institute of Justice's **Recidivism Forecasting Challenge** data: 25,835 people released from Georgia prisons to parole supervision, 2013–2015. Download the CSV from Canvas, put it in your portfolio's `data/` folder, and rename it `nij_recidivism.csv`.
+
+A few things to know before you start:
+
+- **Race is recorded only as Black or white.** The data includes no one else.
+- **Counts are top-coded:** "10 or more" prior felony arrests is stored as text. `parse_number()` turns it into 10, which undercounts people with many more.
+- **`Residence_PUMA`** is not a census PUMA code. NIJ grouped Georgia's PUMAs into 25 areas and numbered them 1–25 to protect privacy. You can use it to group people by place, but you can't map it.
+- **`Training_Sample`** is NIJ's own train/test split. Use it.
+
+# Part 1: Load and clean
+
+```{r}
+#| label: setup
+library(tidyverse)
+
+nij <- read_csv("/Users/nippani/Documents/MUSA-5080-portfolio/data/NIJ_s_Recidivism_Challenge_Full_Dataset_20240407.csv") %>%
+  mutate(
+    recid              = as.integer(Recidivism_Within_3years),
+    male               = as.integer(Gender == "M"),
+    age_group          = factor(Age_at_Release),
+    prison_years       = factor(Prison_Years,
+                                levels = c("Less than 1 year", "1-2 years",
+                                           "Greater than 2 to 3 years",
+                                           "More than 3 years")),
+    prior_fel_arrests  = parse_number(Prior_Arrest_Episodes_Felony),
+    prior_misd_arrests = parse_number(Prior_Arrest_Episodes_Misd),
+    puma               = factor(Residence_PUMA)
+  )
+
+train <- nij %>% filter(Training_Sample == 1)
+test  <- nij %>% filter(Training_Sample == 0)
+```
+
+**1.1** How many people are in `train` and in `test`? What share of each was rearrested within three years?
+
+```{r}
+counts <- data.frame(
+  Sample     = c("Train", "Test"),
+  N          = c(nrow(train), nrow(test)),
+  Recidivist = c(sum(train$recid == 1, na.rm = TRUE),
+                 sum(test$recid  == 1, na.rm = TRUE))
+)
+counts$Share <- round(counts$Recidivist / counts$N, 3)
+
+knitr::kable(counts, caption = "Sample sizes and recidivism counts")
+```
+
+*Your answer:*
+There are 18,028 people in the training dataset and 7,807 in test. Of these, 57.8% were rearrested in the training dataset and 57.4 in test.
+
+**1.2** Look at `Gang_Affiliated`. How many values are missing, and who are they? (Hint: cross-tabulate it with `Gender`.) What would happen to your sample if you added this variable to a model without handling the missing values?
+
+```{r}
+# your code here
+sum(is.na(train$Gang_Affiliated))
+
+table(train$Gender[is.na(train$Gang_Affiliated)])
+table(train$Gender)
+```
+
+*Your answer:*
+There are 2217 values missing in the gang_affiliated var for the training dataset. The tabulation shows that this var is missing for all female individuals. Including this variable without handling the missing values would result in all women being dropped.
+
+# Part 2: What would you know at the moment of decision?
+
+The parole decision happens **at release**. Some columns in this file were recorded **during** the three years of supervision that followed.
+
+**2.1** Sort every predictor column into one of two lists. You don't need code; use `names(nij)` and the column names.
+
+| Known at release | Recorded during supervision (leakage) |
+|---|---|
+| Gender, Race (known, but excluded by promise), Age_at_Release, Residence_PUMA, Gang_Affiliated, Supervision_Risk_Score_First, Supervision_Level_First, Education_Level, Dependents, Prison_Offense, Prison_Years | Violations_ElectronicMonitoring, Violations_Instruction, Violations_FailToReport, Violations_MoveWithoutPermission |
+| Prior_Arrest_Episodes_Felony, _Misd, _Violent, _Property, _Drug, _PPViolationCharges, _DVCharges, _GunCharges | Delinquency_Reports, Program_Attendances, Program_UnexcusedAbsences, Residence_Changes |
+| Prior_Conviction_Episodes_Felony, _Misd, _Viol, _Prop, _Drug, _PPViolationCharges, _DomesticViolenceCharges, _GunCharges | Avg_Days_per_DrugTest, DrugTests_THC_Positive, DrugTests_Cocaine_Positive, DrugTests_Meth_Positive, DrugTests_Other_Positive |
+| Prior_Revocations_Parole, Prior_Revocations_Probation, Condition_MH_SA, Condition_Cog_Ed, Condition_Other | Percent_Days_Employed, Jobs_Per_Year, Employment_Exempt, Recidivism_Arrest_Year1, _Year2, _Year3 (these are the outcome itself) |
+
+Note: the two `_First` supervision variables are assigned at the start of supervision, so I treat them as known at release. But they are outputs of the state's existing risk tool, so putting them in the model would partly just copy that tool.
+
+**2.2** Pick one variable from the right-hand column and explain, in two sentences, why including it would make your model look better than it really is.
+
+*Your answer:*
+Percent_Days_Employed is measured over the supervision period, and someone who gets rearrested and locked up early has fewer days in which they could be employed, so the variable is partly a consequence of the outcome rather than a predictor of it. The model would pick this up and look very accurate on the test set, but at the moment of release we would never have this number, so the accuracy wouldnt carry over to actual decisions.
+
+# Part 3: Build a race-blind model
+
+Start from this model.
+
+```{r}
+#| label: base-model
+base_fit <- glm(recid ~ male + age_group + prison_years +
+                  prior_fel_arrests + prior_misd_arrests,
+                family = binomial,
+                data = train)
+
+summary(base_fit)
+```
+
+**3.1** Exponentiate the coefficients. Interpret the odds ratio for `prior_fel_arrests` in one sentence, using the word *odds* correctly.
+
+```{r}
+or_table <- tibble(
+  term       = names(coef(base_fit)),
+  odds_ratio = exp(coef(base_fit)),
+  ci_low     = exp(confint.default(base_fit))[, 1],
+  ci_high    = exp(confint.default(base_fit))[, 2]
+)
+
+knitr::kable(or_table, digits = 3, caption = "Odds ratios, base model")
+```
+
+*Your answer:*
+Holding gender, age, time in prison and prior misdemeanor arrests constant, each additional prior felony arrest multiplies the odds of being rearrested within three years by 1.18 (95% CI 1.17–1.20), i.e. about 18% higher odds (not an 18% higher probability).
+
+**3.2** Constant on the odds, not on the probability. Use `predict(..., type = "response")` with `newdata` to compute the predicted probability for two made-up people, then add one prior felony arrest to each:
+
+- a man, age 23–27, 1–2 years in prison, 2 prior felony arrests, 1 misdemeanor arrest
+- a man, age 48 or older, 1–2 years in prison, 2 prior felony arrests, 1 misdemeanor arrest
+
+How much does one more arrest change each person's probability? Why are the two changes different?
+
+```{r}
+people <- tibble(
+  male               = c(1, 1),
+  age_group          = factor(c("23-27", "48 or older"), levels = levels(nij$age_group)),
+  prison_years       = factor(c("1-2 years", "1-2 years"), levels = levels(nij$prison_years)),
+  prior_fel_arrests  = c(2, 2),
+  prior_misd_arrests = c(1, 1)
+)
+
+p_before <- predict(base_fit, newdata = people, type = "response")
+p_after  <- predict(base_fit,
+                    newdata = people %>% mutate(prior_fel_arrests = prior_fel_arrests + 1),
+                    type = "response")
+
+tibble(person   = c("Age 23-27", "Age 48 or older"),
+       p_before = p_before,
+       p_after  = p_after,
+       change   = p_after - p_before) %>%
+  knitr::kable(digits = 3, caption = "Effect of one more prior felony arrest")
+```
+
+*Your answer:*
+For the 23-27 year old the predicted probability goes from 0.565 to 0.605 (+4.1 points), and for the 48+ man from 0.179 to 0.205 (+2.6 points). The odds get multiplied by the same factor for both, but the logistic curve is steepest around 0.5 and flattens out toward 0 and 1, so the same multiplication on the odds moves the probability more for whoever starts closer to 0.5. So the "effect" of an arrest on probability depends on everything else about the person.
+
+**3.3** Improve the model. Add at least **three** predictors from your "known at release" list. Keep race out. Call it `my_fit`. In two or three sentences, say what you added and why you expected each one to help.
+
+::: {.callout-warning}
+## Check for missing values before you add a variable
+Some columns have blanks: `Prison_Offense` is missing for about 1 in 8 people, and `Supervision_Level_First` for about 1 in 15. If you add one as it is, `glm()` **silently drops** those people from training, and `predict()` returns `NA` for them in `test`. Then `mean()` gives `NA` in Parts 4–6, and `table()` quietly leaves them out. Either leave the variable out, or keep the blanks as their own category, for example `mutate(offense = replace_na(Prison_Offense, "Missing"))`. Whichever you choose, say so in your answer.
+:::
+
+```{r}
+#| label: my-model
+add_vars <- function(d) {
+  d %>%
+    mutate(
+      offense            = factor(replace_na(Prison_Offense, "Missing")),
+      prior_viol_arrests = parse_number(Prior_Arrest_Episodes_Violent),
+      prior_fel_conv     = parse_number(Prior_Conviction_Episodes_Felony),
+      prior_revoc_parole = as.integer(as.logical(Prior_Revocations_Parole)),
+      prior_revoc_prob   = as.integer(as.logical(Prior_Revocations_Probation)),
+      education          = factor(Education_Level)
+    )
+}
+
+train <- add_vars(train)
+test  <- add_vars(test)
+
+# check none of the new variables have blanks
+train %>%
+  summarize(across(c(offense, prior_viol_arrests, prior_fel_conv,
+                     prior_revoc_parole, prior_revoc_prob, education),
+                   ~ sum(is.na(.x))))
+
+my_fit <- glm(recid ~ male + age_group + prison_years +
+                prior_fel_arrests + prior_misd_arrests +
+                prior_viol_arrests + prior_fel_conv +
+                prior_revoc_parole + prior_revoc_prob +
+                education + offense,
+              family = binomial,
+              data = train)
+
+summary(my_fit)
+
+# sanity check: no one dropped
+c(nobs_used = nobs(my_fit), n_train = nrow(train))
+```
+
+*Your answer:*
+I added prior violent arrests and prior felony convictions (convictions are a stricter signal than arrests), prior parole and probation revocations (someone who has already been revoked has shown they struggle with supervision conditions, which is close to what "rearrest during parole" is picking up), education level (proxy for labor market prospects after release), and prison offense type. Prison_Offense is missing for about 1 in 8 people so I kept the blanks as a "Missing" category instead of dropping them (all 18,028 people are used). The improvement is modest though: AIC goes from 21,966 to 21,844, and prior violent arrests and felony convictions are not significant once felony arrests are in, which makes sense since they mostly measure the same history. Prior parole revocation turned out to be the strongest of the additions. I left out the Supervision_*_First variables because they come from the state's existing tool, and I want to compare against that tool later rather than copy it.
+
+# Part 4: Choosing a threshold
+
+**4.1** Add a column `p_hat` to `test` with predicted probabilities from `my_fit`, and a column `pred_50` that flags anyone at or above 0.5. (Parts 5 and 6 use these column names.) Then make a confusion matrix and compute sensitivity and specificity.
+
+```{r}
+test$p_hat   <- predict(my_fit, newdata = test, type = "response")
+test$pred_50 <- as.integer(test$p_hat >= 0.5)
+
+sum(is.na(test$p_hat))  # should be 0
+
+table(Predicted = test$pred_50, Actual = test$recid)
+
+sens_50 <- sum(test$pred_50 == 1 & test$recid == 1) / sum(test$recid == 1)
+spec_50 <- sum(test$pred_50 == 0 & test$recid == 0) / sum(test$recid == 0)
+
+tibble(sensitivity = sens_50, specificity = spec_50) %>%
+  knitr::kable(digits = 3)
+```
+
+*Your answer:*
+At 0.5 the sensitivity is 0.820 (3,675 of 4,483) and specificity is 0.461 (1,532 of 3,324). So the model catches 82% of people who were rearrested, but only correctly clears 46% of people who weren't, meaning 1,792 people who were not rearrested still got flagged.
+
+**4.2** What share of the test set does your model label "high risk" at 0.5? Compare it to the share actually rearrested. What does that tell you about 0.5 as a default for this data?
+
+```{r}
+tibble(share_flagged = mean(test$pred_50),
+       share_rearrested = mean(test$recid)) %>%
+  knitr::kable(digits = 3)
+```
+
+*Your answer:*
+The model labels 70.0% of the test set high risk (5,467 of 7,807), compared to 57.4% actually rearrested. Because the base rate is already above 0.5, most people's predicted probability sits above 0.5 too, so the cutoff ends up flagging the majority of parolees. 0.5 isnt a neutral default here, it just happens to fall below where most of the predictions are, and whether that's acceptable depends on what the flag triggers.
+
+**4.3** Compute sensitivity and specificity for every threshold from 0.30 to 0.80 in steps of 0.05, and plot both lines on one chart with threshold on the x-axis.
+
+Hint: in the lab you called `rates_at()` three times by hand. Here you need eleven thresholds. `map_dfr(thresholds, function(t) ...)` runs the same code once per threshold and stacks the results into one data frame. Your version will need `p_hat` instead of `pred`, and `recid` instead of `two_year_recid`.
+
+```{r}
+rates_at <- function(t) {
+  pred <- as.integer(test$p_hat >= t)
+  tibble(
+    threshold     = t,
+    sensitivity   = sum(pred == 1 & test$recid == 1) / sum(test$recid == 1),
+    specificity   = sum(pred == 0 & test$recid == 0) / sum(test$recid == 0),
+    share_flagged = mean(pred)
+  )
+}
+
+thresholds <- round(seq(0.30, 0.80, by = 0.05), 2)
+sweep <- map_dfr(thresholds, rates_at)
+
+knitr::kable(sweep, digits = 3, caption = "Threshold sweep, test set")
+
+sweep %>%
+  pivot_longer(c(sensitivity, specificity), names_to = "metric", values_to = "rate") %>%
+  ggplot(aes(threshold, rate, color = metric)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = thresholds) +
+  labs(x = "Threshold", y = "Rate", color = NULL,
+       title = "Sensitivity and specificity by threshold") +
+  theme_minimal()
+```
+
+**4.4** Plot the ROC curve for `my_fit` on the test set with `pROC` and report the AUC. In one sentence: what does the AUC tell you, and what doesn't it tell you about the decision the department has to make?
+
+```{r}
+library(pROC)
+
+roc_obj <- roc(response = test$recid, predictor = test$p_hat, quiet = TRUE)
+auc(roc_obj)
+
+ggroc(roc_obj, legacy.axes = TRUE) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+  labs(x = "False positive rate (1 - specificity)", y = "Sensitivity",
+       title = paste0("ROC curve, my_fit on test (AUC = ", round(auc(roc_obj), 3), ")")) +
+  theme_minimal()
+```
+
+*Your answer:*
+The AUC is 0.706, meaning that if you pick one random person who was rearrested and one who wasn't, the model gives the rearrested person a higher score about 71% of the time. It doesnt tell the department where to put the cutoff, since that depends on what a false positive and false negative cost in each use, and it says nothing about whether those errors fall equally on Black and white parolees.
+
+# Part 5: Is it race-blind?
+
+Race isn't in your model. Now check the errors by race on the **test set**.
+
+**5.1** At the threshold of 0.5, compute for each race: the share labeled high risk, the share actually rearrested, the **false positive rate** (labeled high risk, not rearrested, out of everyone not rearrested), and the **false negative rate**.
+
+```{r}
+race_rates <- function(t) {
+  test %>%
+    mutate(pred = as.integer(p_hat >= t)) %>%
+    group_by(Race) %>%
+    summarize(
+      threshold        = t,
+      n                = n(),
+      share_flagged    = mean(pred),
+      share_rearrested = mean(recid),
+      fpr              = sum(pred == 1 & recid == 0) / sum(recid == 0),
+      fnr              = sum(pred == 0 & recid == 1) / sum(recid == 1),
+      .groups = "drop"
+    )
+}
+
+race_rates(0.5) %>%
+  knitr::kable(digits = 3, caption = "Error rates by race at 0.5")
+```
+
+**5.2** Repeat 5.1 at two other thresholds from your sweep. Does the gap between groups close, stay, or flip?
+
+```{r}
+race_sweep <- map_dfr(c(0.4, 0.5, 0.6), race_rates)
+
+knitr::kable(race_sweep, digits = 3, caption = "Error rates by race at three thresholds")
+
+# gaps (Black minus white)
+race_sweep %>%
+  select(threshold, Race, share_flagged, fpr, fnr) %>%
+  pivot_wider(names_from = Race, values_from = c(share_flagged, fpr, fnr)) %>%
+  mutate(fpr_gap  = fpr_BLACK - fpr_WHITE,
+         fnr_gap  = fnr_BLACK - fnr_WHITE,
+         flag_gap = share_flagged_BLACK - share_flagged_WHITE) %>%
+  select(threshold, fpr_gap, fnr_gap, flag_gap) %>%
+  knitr::kable(digits = 3, caption = "Black minus white gaps")
+```
+
+*Your answer:*
+At 0.5 the false positive rate is **[X]** for Black parolees vs **[X]** for white parolees, and the false negative rate goes the other way (**[X]** vs **[X]**). Moving the threshold to 0.4 or 0.6 shifts both groups' error rates up or down together, but the gap **[stays / narrows to X / widens to X]** and doesn't flip. Moving the threshold only trades off sensitivity against specificity for everyone, it doesn't change the fact that Black parolees' score distribution sits higher, so a Black person who would not be rearrested is still more likely to get flagged.
+
+**5.3** Investigate at least two candidates by comparing their distributions by race. Possibilities include age, prior arrests, prison offense, and place (`puma`). Show your evidence with a table or chart for each.
+
+```{r}
+# (a) prior record
+test %>%
+  group_by(Race) %>%
+  summarize(mean_fel_arrests   = mean(prior_fel_arrests),
+            share_topcoded_fel = mean(prior_fel_arrests == 10),
+            mean_misd_arrests  = mean(prior_misd_arrests),
+            mean_fel_conv      = mean(prior_fel_conv),
+            share_revoc_parole = mean(prior_revoc_parole)) %>%
+  knitr::kable(digits = 3, caption = "Prior record by race")
+
+ggplot(test, aes(prior_fel_arrests, fill = Race)) +
+  geom_bar(aes(y = after_stat(prop)), position = "dodge") +
+  labs(x = "Prior felony arrests (10 = 10 or more)", y = "Share within race",
+       title = "Prior felony arrests by race") +
+  theme_minimal()
+
+# (b) age at release
+test %>%
+  count(Race, age_group) %>%
+  group_by(Race) %>%
+  mutate(share = n / sum(n)) %>%
+  ggplot(aes(age_group, share, fill = Race)) +
+  geom_col(position = "dodge") +
+  labs(x = "Age at release", y = "Share within race", title = "Age at release by race") +
+  theme_minimal()
+
+# (c) prison offense
+test %>%
+  count(Race, offense) %>%
+  group_by(Race) %>%
+  mutate(share = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Race, values_from = share) %>%
+  knitr::kable(digits = 3, caption = "Prison offense by race (column shares)")
+
+# (d) place
+test %>%
+  group_by(puma) %>%
+  summarize(n = n(),
+            share_black = mean(Race == "BLACK"),
+            share_rearrested = mean(recid),
+            mean_p_hat = mean(p_hat)) %>%
+  arrange(desc(share_black)) %>%
+  knitr::kable(digits = 3, caption = "PUMA groups by share Black")
+```
+
+*Your answer:*
+Prior record is the clearest channel: Black parolees in the test set average **[X]** prior felony arrests vs **[X]** for white parolees, and **[X]**% vs **[X]**% are at the top code. Since prior arrests have one of the biggest coefficients, this alone pushes Black parolees' scores up. Arrests also arent a neutral measure of behavior, they partly reflect where policing is concentrated, so the model inherits that. Age works in the **[same / opposite]** direction: Black parolees are **[younger / older]** on average (**[X]**% under 28 vs **[X]**%), and younger age raises predicted risk. Place is strongly sorted by race too, with share Black ranging from **[X]** to **[X]** across PUMA groups, though `puma` isnt in my model yet. So the model doesnt see race, but it sees things that are distributed differently by race, and that's enough to produce the gaps in 5.1.
+
+
+# Part 6: Does it hold up in places it hasn't seen?
+
+Use leave-one-PUMA-group-out cross-validation **on the training set**, the same recipe as Week 10's leave-one-district-out.
+
+```{r}
+pumas <- levels(train$puma)
+
+cv_puma <- map_dfr(pumas, function(u) {
+  cv_train <- train %>% filter(puma != u)
+  cv_test  <- train %>% filter(puma == u)
+
+  fit <- glm(formula(my_fit), family = binomial, data = cv_train)
+
+  cv_test %>%
+    mutate(pred = as.integer(predict(fit, newdata = cv_test,
+                                     type = "response") >= 0.5)) %>%
+    summarize(puma       = u,
+              n          = n(),
+              share_black = mean(Race == "BLACK"),
+              accuracy   = mean(pred == recid),
+              fpr        = sum(pred == 1 & recid == 0) / sum(recid == 0))
+})
+```
+
+**6.1** Plot each PUMA group's false positive rate against its share of Black parolees. What pattern, if any, do you see?
+
+```{r}
+ggplot(cv_puma, aes(share_black, fpr)) +
+  geom_point(aes(size = n), alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "grey40") +
+  labs(x = "Share of parolees who are Black", y = "False positive rate (held out)",
+       size = "N", title = "Leave-one-PUMA-group-out: FPR vs share Black") +
+  theme_minimal()
+
+cor(cv_puma$share_black, cv_puma$fpr)
+
+knitr::kable(cv_puma %>% arrange(desc(share_black)), digits = 3)
+```
+
+*Your answer:*
+There is a moderate positive relationship: PUMA groups with a higher share of Black parolees have higher held-out false positive rates (correlation = 0.37). With only 25 groups, a few of them small, I wouldnt lean too hard on the slope, but it fits 5.1: the model over-flags people who don't go on to be rearrested in exactly the places where more Black parolees live. Accuracy ranges from **[X]** to **[X]** across groups, so how well the model works also depends on where you're released to.
+
+**6.2** If you put `puma` itself into the model as a predictor, would that make the model more or less race-blind? Make an argument using what you found in 6.1. (You may test it, but you don't have to.)
+
+*Your answer:*
+Technically it would still be race-blind since race isnt in it, but in practice less so. Share Black varies a lot across PUMA groups, so `puma` would work as a partial stand-in for race, and the model would be allowed to raise someone's score just for where they live. It's possible it would shrink the FPR pattern in 6.1, because the model could adjust for each area's base rate rather than applying one statewide curve. But that base rate itself reflects local policing and local opportunities, so we'd be building neighborhood disadvantage directly into each person's score. That's the accident-of-birth problem in the model's own structure. Whether it's "fairer" depends on whether you care about equal error rates or about not penalizing people for things they didnt choose, and putting `puma` in helps the first by giving up the second.
+
+# Part 7: The memo
+
+Write a memo (**400–600 words**) to the Department of Community Supervision. It must:
+
+1. **Pick a threshold for Use A and a threshold for Use B**, and defend each using the cost of a false positive and a false negative *in that use*. Cite your own numbers from Parts 4 and 5.
+2. Tell them **whether "the model doesn't use race" means it treats Black and white parolees the same**, using your Part 5 results.
+3. End with one sentence: **"I would / would not deploy this for Use ___, unless ___."**
+
+Write to a deputy commissioner, not to a statistician. No code, no jargon you haven't explained.
+
+*Your memo:*
+
+**To:** Deputy Commissioner, Georgia Department of Community Supervision
+**From:** Abishek Nippani
+**Re:** Proposed parole risk model: thresholds and the race-neutrality promise
+
+The model gives each person released to parole a score: its estimate of the chance they are rearrested within three years. To use it you have to choose a cutoff. Everyone above it is flagged. Any cutoff makes two kinds of mistakes. A *false positive* is flagging someone who would not have been rearrested. A *false negative* is missing someone who would have been. The right cutoff depends on which mistake costs more, and that is different for your two proposed uses.
+
+**Use A (more restrictive supervision).** Here a false positive is costly. A person who would have stayed out of trouble gets more check-ins, electronic monitoring and faster revocation. That makes it harder to hold a job, and it raises the chance of going back to prison on a technical violation rather than a new crime. A false negative means someone at higher risk gets standard supervision, which is what everyone gets today. So the cutoff should be high. I recommend **[0.65 / 0.70]**. At that level the model flags **[X]**% of parolees and wrongly flags **[X]**% of people who would not be rearrested, compared to 54% at the 0.5 default, where it flags 70% of everyone. The trade-off is that it catches only **[X]**% of people who are rearrested.
+
+**Use B (priority for reentry services).** Here a false positive is cheap. Someone at lower risk gets housing help or a case manager they may not have needed, which costs money but does no harm. A false negative means someone who needed support was passed over. So the cutoff should be lower. I recommend **[0.40 / 0.45]**, which catches **[X]**% of those who are rearrested while flagging **[X]**% of parolees. If service slots are limited, set the cutoff by capacity, not by a probability. One caution: a rearrest score measures risk, not need. Some people with high needs and lower scores will still be missed.
+
+**Does "no race in the model" mean equal treatment?** No. I left race out of the model and checked how its errors fall on Black and white parolees separately. At the 0.5 cutoff, **[X]**% of Black parolees who were *not* rearrested were still flagged, compared to **[X]**% of white parolees. At 0.4 and 0.6 the gap was **[X]** and **[X]** points, so changing the cutoff does not remove it. The model doesn't need race to produce this. It relies heavily on prior arrests, and Black parolees in this data have more of them on average (**[X]** vs **[X]**). Arrest counts reflect where policing is concentrated as well as behavior. Age and place also differ by race. Leaving race out keeps the formula clean, but it does not make the results equal.
+
+For Use A, this means Black parolees who pose no added risk would carry the cost of restrictive supervision more often than white parolees. For Use B, the same gap would steer more services toward Black parolees. That is less harmful, but it still rests on a measure that partly reflects policing.
+
+**Recommendation.** Whatever you adopt, publish the false positive rate by race every year, and treat a gap above an agreed level as a reason to review the tool.
+
+I would deploy this for Use B, unless the department is unable to commit to a yearly audit of who gets flagged and who gets wrongly flagged, by race.
+
+# Optional challenge (no extra points. just extra muscles.)
+
+`Supervision_Risk_Score_First` is the score Georgia's existing risk tool assigned at the start of supervision. Treat a score of 7 or higher as "high risk" and compute its false positive rates by race on the test set. Does the state's current tool look better or worse than yours?
+
+```{r}
+state_tool <- test %>%
+  filter(!is.na(Supervision_Risk_Score_First)) %>%
+  mutate(state_high = as.integer(Supervision_Risk_Score_First >= 7)) %>%
+  group_by(Race) %>%
+  summarize(tool          = "State tool (score >= 7)",
+            share_flagged = mean(state_high),
+            fpr           = sum(state_high == 1 & recid == 0) / sum(recid == 0),
+            fnr           = sum(state_high == 0 & recid == 1) / sum(recid == 1),
+            .groups = "drop")
+
+mine <- race_rates(0.5) %>%
+  transmute(Race, tool = "my_fit (p >= 0.5)", share_flagged, fpr, fnr)
+
+bind_rows(state_tool, mine) %>%
+  arrange(tool, Race) %>%
+  knitr::kable(digits = 3, caption = "State tool vs my_fit, by race")
+
+sum(is.na(test$Supervision_Risk_Score_First))  # people with no state score
+```
